@@ -327,19 +327,30 @@
     }
 
     // ---------- Хуки Input: пользовательские маппинги ----------
-    // Свой "триггер"-детект для клавиатуры: onKeyPress очищает _keys,
-    // поэтому standardTriggered не подходит — ведём prev-снимки сами.
+    // ВАЖНО: в MZ объект Input НЕ создаёт Input._keys при загрузке скриптов —
+    // this._keys инициализируется только в Input.initialize() (внутри
+    // SceneManager.run(), т.е. уже после загрузки всех плагинов). Поэтому все
+    // обращения к таблице клавиш идут через safe-геттер: до инициализации
+    // возвращаем пустой объект вместо TypeError ("Cannot read property
+    // 'ArrowLeft' of undefined").
     Input._arthousePrevKeys = null;
     Input._arthousePrevPads = null;
 
+    Input._arthouseKeys = function () {
+        return this._keys || {};
+    };
+
+    // Свой "триггер"-детект для клавиатуры: onKeyPress очищает _keys,
+    // поэтому standardTriggered не подходит — ведём prev-снимки сами.
     Input._arthouseKeyTriggered = function (mapping) {
         if (!this._arthousePrevKeys) return false;
+        const keys = this._arthouseKeys();
         return mapping.some(keyCode =>
-            this._keys[keyCode] && !this._arthousePrevKeys[keyCode]);
+            keys[keyCode] && !this._arthousePrevKeys[keyCode]);
     };
 
     Input._arthousePadPressed = function (buttonId) {
-        const pads = navigator.gamepads || this.gamepads();
+        const pads = this.gamepads();
         if (!pads) return false;
         for (let i = 0; i < pads.length; i++) {
             const pad = pads[i];
@@ -350,7 +361,7 @@
 
     Input._arthousePadTriggered = function (buttonId) {
         if (!this._arthousePrevPads) return false;
-        const pads = navigator.gamepads || this.gamepads();
+        const pads = this.gamepads();
         if (!pads) return false;
         for (let i = 0; i < pads.length; i++) {
             const pad = pads[i];
@@ -366,8 +377,8 @@
 
     // Обновление prev-снимков один раз за игровой цикл (Scene_Base.update)
     Input._arthouseUpdateSnapshots = function () {
-        this._arthousePrevKeys = Object.assign({}, this._keys);
-        const pads = navigator.gamepads || this.gamepads();
+        this._arthousePrevKeys = Object.assign({}, this._arthouseKeys());
+        const pads = this.gamepads();
         if (pads) {
             this._arthousePrevPads = this._arthousePrevPads || [];
             for (let i = 0; i < pads.length; i++) {
@@ -384,7 +395,7 @@
     const _Input_isPressed = Input.isPressed;
     Input.isPressed = function (mapping) {
         const km = ConfigManager.arthouseKeyMap;
-        if (km && km[mapping] && km[mapping].some(c => this._keys[c])) return true;
+        if (km && km[mapping] && km[mapping].some(c => this._arthouseKeys()[c])) return true;
         const pm = ConfigManager.arthousePadMap;
         if (pm && pm[mapping] && pm[mapping].some(b => this._arthousePadPressed(b))) return true;
         return _Input_isPressed.call(this, mapping);
@@ -783,12 +794,12 @@
     };
 
     Scene_ArthousePadConfig.prototype._padPresent = function () {
-        const pads = navigator.gamepads || Input.gamepads();
+        const pads = Input.gamepads();
         return !!(pads && pads.some(p => p));
     };
 
     Scene_ArthousePadConfig.prototype._detectPressedButton = function () {
-        const pads = navigator.gamepads || Input.gamepads();
+        const pads = Input.gamepads();
         if (!pads) return -1;
         for (let i = 0; i < pads.length; i++) {
             const pad = pads[i];
@@ -842,7 +853,7 @@
     };
 
     Scene_ArthousePadConfig.prototype._detectPressedButton = function () {
-        const pads = navigator.gamepads || Input.gamepads();
+        const pads = Input.gamepads();
         if (!pads) return -1;
         for (let i = 0; i < pads.length; i++) {
             const pad = pads[i];
