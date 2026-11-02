@@ -43,6 +43,12 @@
  * Управление на титуле: мышь (наведение/клик) или стрелки Up/Down + Enter.
  * Настройки сохраняются через ConfigManager (sys/config.rpgsaveobject).
  *
+ * Экраны сохранений (Load/Save) тоже перерисованы в артхаус-стиль:
+ *   - "догнаться" на титуле -> список слотов ("сохранение N" + title/ур./время)
+ *   - команда сохранения из меню/событий (266) и загрузки (267) -> тот же стиль
+ *   - штатные окна Window_SaveFile скрыты, popScene работает как обычно
+ * Пустые слоты при загрузке мигают buzzer'ом; при сохранении пишутся поверх.
+ *
  * @param angelPath
  * @text Путь к спрайту ангела
  * @desc Относительный путь к спрайт-листу (4 кадра x 300px)
@@ -392,30 +398,30 @@
         }
     };
 
-    const _Input_isPressed = Input.isPressed;
-    Input.isPressed = function (mapping) {
+    // ВАЖНО: в MZ Input.isPressed/isTriggered/isRepeated вызывают
+    // this.isPressedStandard / isTriggeredStandard / isRepeatedStandard,
+    // а НЕ сами публичные методы. Поэтому хукаем именно *Standard-функции:
+    // кастомные маппинги проверяются ПЕРЕД стандартными таблицами MZ.
+    const _Input_isPressedStandard = Input.isPressedStandard;
+    Input.isPressedStandard = function (mapping) {
         const km = ConfigManager.arthouseKeyMap;
         if (km && km[mapping] && km[mapping].some(c => this._arthouseKeys()[c])) return true;
         const pm = ConfigManager.arthousePadMap;
         if (pm && pm[mapping] && pm[mapping].some(b => this._arthousePadPressed(b))) return true;
-        return _Input_isPressed.call(this, mapping);
+        return _Input_isPressedStandard.call(this, mapping);
     };
 
-    const _Input_isTriggered = Input.isTriggered;
-    Input.isTriggered = function (mapping) {
+    const _Input_isTriggeredStandard = Input.isTriggeredStandard;
+    Input.isTriggeredStandard = function (mapping) {
         const km = ConfigManager.arthouseKeyMap;
         if (km && km[mapping] && this._arthouseKeyTriggered(km[mapping])) return true;
         const pm = ConfigManager.arthousePadMap;
         if (pm && pm[mapping] && pm[mapping].some(b => this._arthousePadTriggered(b))) return true;
-        return _Input_isTriggered.call(this, mapping);
+        return _Input_isTriggeredStandard.call(this, mapping);
     };
 
-    const _Input_isRepeated = Input.isRepeated;
-    Input.isRepeated = function (mapping) {
-        // isRepeated == triggered || pressed — достаточно делегнуть в isPressed,
-        // т.к. оригинал внутри вызывает именно их.
-        return _Input_isRepeated.call(this, mapping);
-    };
+    // isRepeatedStandard() внутри вызывает this.isTriggered()/isPressed(),
+    // которые уже идут через наши хуки — отдельный перехват не нужен.
 
     // Снимки обновляются в начале каждого игрового кадра
     const _Scene_Base_update = Scene_Base.prototype.update;
@@ -878,6 +884,12 @@
     Scene_ArthouseOptions.prototype = Object.create(Scene_Base.prototype);
     Scene_ArthouseOptions.prototype.constructor = Scene_ArthouseOptions;
 
+    // kind: 'options' (настройки) | 'load' (загрузить) | 'save' (сохранить)
+    Scene_ArthouseOptions.prototype.initialize = function (kind) {
+        Scene_Base.prototype.initialize.call(this);
+        this._kind = kind || 'options';
+    };
+
     Scene_ArthouseOptions.prototype.create = function () {
         Scene_Base.prototype.create.call(this);
         this._buildUI();
@@ -892,6 +904,21 @@
     Scene_ArthouseOptions.prototype.update = function () {
         Scene_Base.prototype.update.call(this);
         if (!this.isBusy()) this._updateInput();
+
+        // В режиме загрузчика: если сохранений совсем нет — подсказка под заголовком
+        if (this._kind === 'load') {
+            const any = this._rows.some(r => StorageManager.loadSavefile(r.slot + 1));
+            if (!any && !this._emptyHint) {
+                const W = Graphics.width;
+                this._emptyHint = new PIXI.Text('пусто... налей сначала', {
+                    fontFamily: FONT_STACK, fontSize: 36, fontWeight: 'bold',
+                    fill: CONFIG.COL_INK
+                });
+                this._emptyHint.x = 80; this._emptyHint.y = 150;
+                this._emptyHint.alpha = 0.6;
+                this._container.addChild(this._emptyHint);
+            }
+        }
     };
 
     Scene_ArthouseOptions.prototype._buildUI = function () {
@@ -908,8 +935,9 @@
         bg.endFill();
         container.addChild(bg);
 
-        // Заголовок
-        const title = new PIXI.Text('опционально!', {
+        // Заголовок зависит от режима сцены
+        const titles = { options: 'опционально!', load: 'догнаться?', save: 'налить снова?' };
+        const title = new PIXI.Text(titles[this._kind] || 'опционально!', {
             fontFamily: FONT_STACK, fontSize: 100, fontWeight: 'bold',
             fill: CONFIG.COL_INK
         });
@@ -917,27 +945,41 @@
         title.rotation = -0.03;
         container.addChild(title);
 
-        // Строки настроек
-        this._rows = [
-            { label: 'музыка',       type: 'volume' },
-            { label: 'звуки',        type: 'volume' },
-            { label: 'разрешение',   type: 'resolution' },
-            { label: 'полный экран', type: 'fullscreen' },
-            { label: 'клавиши...',   type: 'scene', scene: Scene_ArthouseKeyConfig },
-            { label: 'геймпад...',   type: 'scene', scene: Scene_ArthousePadConfig }
-        ];
+        // Строки: настройки ИЛИ слоты сохранений (в том же артхаус-стиле)
+        this._rows = [];
+        if (this._kind === 'options') {
+            this._rows = [
+                { label: 'музыка',       type: 'volume' },
+                { label: 'звуки',        type: 'volume' },
+                { label: 'разрешение',   type: 'resolution' },
+                { label: 'полный экран', type: 'fullscreen' },
+                { label: 'клавиши...',   type: 'scene', scene: Scene_ArthouseKeyConfig },
+                { label: 'геймпад...',   type: 'scene', scene: Scene_ArthousePadConfig }
+            ];
+        } else {
+            const slots = ($dataSystem && $dataSystem.saveSlots) || [];
+            for (let i = 0; i < slots.length; i++) {
+                this._rows.push({ slot: i, type: 'slot' });
+            }
+            // В инвентаре/меню игра может быть не загружена — слотов нет
+            if (this._rows.length === 0) {
+                this._rows.push({ slot: 0, type: 'slot' });
+            }
+        }
         this._rowLabels = [];
         this._rowValues = [];
 
-        const startY = 200, stepY = 78;
+        const startY = 200;
+        const stepY = Math.min(78, Math.max(52, (H - startY - 120) / Math.max(this._rows.length, 1)));
         this._startY = startY;
         this._stepY = stepY;
 
         this._rows.forEach((row, i) => {
             const y = startY + i * stepY;
+            const fs = Math.min(42, stepY * 0.62);
 
-            const lbl = new PIXI.Text(row.label, {
-                fontFamily: FONT_STACK, fontSize: 42, fontWeight: 'bold',
+            const lbl = new PIXI.Text(row.type === 'slot' ? '' : row.label, {
+                fontFamily: FONT_STACK, fontSize: fs, fontWeight: 'bold',
                 fill: CONFIG.COL_INK
             });
             lbl.x = 80; lbl.y = y;
@@ -945,7 +987,7 @@
             this._rowLabels.push(lbl);
 
             const val = new PIXI.Text('', {
-                fontFamily: FONT_STACK, fontSize: 42, fontWeight: 'bold',
+                fontFamily: FONT_STACK, fontSize: fs, fontWeight: 'bold',
                 fill: CONFIG.COL_INK
             });
             val.anchor.set(0.5, 0);
@@ -953,11 +995,11 @@
             container.addChild(val);
             this._rowValues.push(val);
 
-            // Для строк-ссылок ("клавиши...", "геймпад...") стрелки < > не нужны
-            if (row.type === 'scene') return;
+            // Для строк-ссылок и слотов стрелки < > не нужны
+            if (row.type !== 'volume' && row.type !== 'resolution' && row.type !== 'fullscreen') return;
 
             const arrL = new PIXI.Text('<', {
-                fontFamily: FONT_STACK, fontSize: 50, fontWeight: 'bold',
+                fontFamily: FONT_STACK, fontSize: fs + 8, fontWeight: 'bold',
                 fill: CONFIG.COL_INK
             });
             arrL.anchor.set(0.5, 0);
@@ -965,7 +1007,7 @@
             container.addChild(arrL);
 
             const arrR = new PIXI.Text('>', {
-                fontFamily: FONT_STACK, fontSize: 50, fontWeight: 'bold',
+                fontFamily: FONT_STACK, fontSize: fs + 8, fontWeight: 'bold',
                 fill: CONFIG.COL_INK
             });
             arrR.anchor.set(0.5, 0);
@@ -988,7 +1030,38 @@
         this._selectedRow = 0;
     };
 
+    // ---------- Отрисовка сохранений в артхаус-стиле (вместо Window_SaveFile) ----------
+    Scene_ArthouseOptions.prototype._slotSummary = function (globalId) {
+        const s = StorageManager.loadSavefile(globalId);
+        if (!s) return null;
+        const parts = [];
+        if (s.title) parts.push(s.title);
+        if (s.level) parts.push('ур.' + s.level);
+        if (s.playtime) parts.push(s.playtime);
+        return {
+            summary: parts.join(' · '),
+            file: s,
+            empty: false
+        };
+    };
+
     Scene_ArthouseOptions.prototype._refreshValues = function () {
+        if (this._kind !== 'options') {
+            // Слоты сохранений: "сохранение 1" + дата/игра/время или "пусто"
+            this._rows.forEach((row, i) => {
+                const globalId = row.slot + 1;
+                const info = this._slotSummary(globalId);
+                this._rowLabels[i].text = 'сохранение ' + (i + 1);
+                if (!info) {
+                    this._rowValues[i].text = '— пусто —';
+                } else {
+                    let t = info.summary || '';
+                    if (t.length > 40) t = t.slice(0, 37) + '...';
+                    this._rowValues[i].text = t;
+                }
+            });
+            return;
+        }
         this._rowValues[0].text = String(ConfigManager.bgmVolume);
         this._rowValues[1].text = String(ConfigManager.seVolume);
         const r = OPTIONS_RESOLUTIONS[ConfigManager.arthouseResolution];
@@ -1028,30 +1101,52 @@
     };
 
     Scene_ArthouseOptions.prototype._changeValue = function (dir) {
-        const r = this._selectedRow;
-        if (r === 0) {
+        const row = this._rows[this._selectedRow];
+        if (!row) return;
+
+        // Слоты сохранений — dir не важен, действие одно: выбрать слот
+        if (row.type === 'slot') {
+            this._activateSlot(row.slot);
+            return;
+        }
+
+        if (row.type === 'volume' && this._selectedRow === 0) {
             ConfigManager.bgmVolume = clamp(ConfigManager.bgmVolume + dir * 10, 0, 100);
             AudioManager.updateBgmParameters(AudioManager._currentBgm);
-        } else if (r === 1) {
+        } else if (row.type === 'volume' && this._selectedRow === 1) {
             ConfigManager.seVolume = clamp(ConfigManager.seVolume + dir * 10, 0, 100);
             AudioManager.updateBgsParameters(AudioManager._currentBgs);
             AudioManager.updateMeParameters(AudioManager._currentMe);
-        } else if (r === 2) {
+        } else if (row.type === 'resolution') {
             const n = OPTIONS_RESOLUTIONS.length;
             ConfigManager.arthouseResolution =
                 (Number(ConfigManager.arthouseResolution) + dir + n) % n;
             applyResolution(ConfigManager.arthouseResolution);
-        } else if (r === 3) {
+        } else if (row.type === 'fullscreen') {
             ConfigManager.arthouseFullscreen = !ConfigManager.arthouseFullscreen;
             applyFullscreen(ConfigManager.arthouseFullscreen);
-        } else if (this._rows[r] && this._rows[r].type === 'scene') {
+        } else if (row.type === 'scene') {
             // "клавиши..." / "геймпад..." — открываем вложенный экран
-            SceneManager.push(this._rows[r].scene);
+            SceneManager.push(row.scene);
             return;
         }
         ConfigManager.save();
         this._refreshValues();
         SoundManager.playOk();
+    };
+
+    Scene_ArthouseOptions.prototype._activateSlot = function (slotIndex) {
+        const globalId = slotIndex + 1;
+        if (this._kind === 'load') {
+            if (!DataManager.loadGame(globalId)) {
+                SoundManager.playBuzzer();
+                return;
+            }
+            this.popScene();   // выходим на титул (как штатный Scene_Load)
+        } else if (this._kind === 'save') {
+            DataManager.saveGame(globalId);
+            this.popScene();   // выходим на карту (как штатный Scene_Save)
+        }
     };
 
     Scene_ArthouseOptions.prototype._updateInput = function () {
@@ -1064,8 +1159,10 @@
         if (!hadTouch) {
             if (Input.isRepeated('up'))    this._selectRow(this._selectedRow - 1);
             if (Input.isRepeated('down'))  this._selectRow(this._selectedRow + 1);
-            if (Input.isRepeated('left'))  this._changeValue(-1);
-            if (Input.isRepeated('right')) this._changeValue(+1);
+            if (this._kind === 'options') {
+                if (Input.isRepeated('left'))  this._changeValue(-1);
+                if (Input.isRepeated('right')) this._changeValue(+1);
+            }
             if (Input.isTriggered('ok'))   this._changeValue(+1);
         }
 
@@ -1076,7 +1173,7 @@
 
         // Обновляем индикатор подключения геймпада ("подключён →")
         this._padPoll = (this._padPoll || 0) + 1;
-        if (this._padPoll % 60 === 0) this._refreshValues();
+        if (this._padPoll % 60 === 0 && this._kind === 'options') this._refreshValues();
     };
 
     Scene_ArthouseOptions.prototype._handleClick = function () {
@@ -1235,7 +1332,8 @@
             SceneManager.goto(Scene_Map);
         };
         const onLoadGame = () => {
-            SceneManager.push(Scene_Load);
+            // Наш стилизованный выбор сохранений (kind='load') вместо штатного Scene_Load
+            SceneManager.push(Scene_ArthouseOptions, 'load');
         };
         const onOptions = () => {
             SceneManager.push(Scene_ArthouseOptions);
@@ -1609,5 +1707,40 @@
         }
         _Scene_Title_terminate.call(this);
     };
+
+    // ===================== ХУКИ Scene_Load / Scene_Save =====================
+    // Полная замена штатных экранов сохранений на артхаус-стиль.
+    // Scene_Load/Scene_Save остаются в цепочке сцен (popScene возвращает туда),
+    // но их окна не создаются — вместо них поверх пушится Scene_ArthouseOptions.
+
+    function arthouseHookSaveLoad(SceneClass, kind) {
+        const _create = SceneClass.prototype.create;
+        SceneClass.prototype.create = function () {
+            _create.call(this);             // стандартные окна будут созданы...
+            this._arthouseHideWindows();    // ...и сразу спрятаны
+            if (!this._arthousePushed) {
+                this._arthousePushed = true;
+                SceneManager.push(Scene_ArthouseOptions, kind);
+            }
+        };
+        SceneClass.prototype._arthouseHideWindows = function () {
+            try {
+                if (this._helpWindow) this._helpWindow.hide();
+                if (this._statusWindow) this._statusWindow.hide();
+                if (this._fileWindow) { this._fileWindow.deactivate(); this._fileWindow.hide(); }
+            } catch (e) {}
+        };
+        const _start = SceneClass.prototype.start;
+        SceneClass.prototype.start = function () {
+            _start.call(this);
+            this._arthouseHideWindows();
+        };
+    }
+    arthouseHookSaveLoad(Scene_Load, 'load');
+    arthouseHookSaveLoad(Scene_Save, 'save');
+
+    // Командки "Save Progress" (266) и "Load Game" (267) идут через
+    // SceneManager.push(Scene_Save/Scene_Load) → хуки create выше уже
+    // всё подменяют, отдельно трогать Game_Interpreter не нужно.
 
 })();
