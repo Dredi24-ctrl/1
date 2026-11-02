@@ -1,5 +1,5 @@
 /*:
- * @plugindesc Arthouse Title + расширенные настройки (экран настроек, музыка/звуки, разрешение, полный экран)
+ * @plugindesc Arthouse Title + расширенные настройки (музыка/звуки, разрешение, полный экран, настройка клавиш и геймпада)
  * @author Arthouse
  * @target MZ
  * @url
@@ -13,6 +13,24 @@
  *   - Звуки (громкость SE)
  *   - Разрешение окна (список, только для NWjs / десктопной сборки)
  *   - Полный экран (Вкл/Выкл)
+ *   - Настройка клавиш клавиатуры (ремап кнопок gamepad mapping'а)
+ *   - Настройка кнопок геймпада (ремап buttons[0..15] на игровые действия)
+ *
+ * Экран настройки клавиш/геймпада открывается кнопкой "опционально!" →
+ * строками "клавиши..." и "геймпад...". Там же есть "сброс" к значениям
+ * по умолчанию. Назначения сохраняются через ConfigManager.
+ *
+ * Как работает ремап:
+ *   Плагин хранит два маппинга в ConfigManager:
+ *     arthouseKeyMap:    действие -> массив keyCode'ев (KeyboardEvent.code)
+ *     arthousePadMap:    действие -> массив индексов кнопок Gamepad
+ *   Действия: ok, escape, menu, cancel, shift, control, pageup, pagedown,
+ *             left, right, up, down.
+ *   При опросе ввода Input.isPressed/isTriggered/isRepeated сначала смотрит
+ *   в пользовательские маппинги, затем — в стандартные таблицы MZ.
+ *   Геймпад полностью поддерживается без ручного ремапа "из коробки"
+ *   (стандартный XInput-маппинг MZ), а этот экран позволяет назначить
+ *   любые кнопки вместо стандартных.
  *
  * Установка:
  *   1. Скопировать файл в js/plugins/Arthouse_Title.js
@@ -54,6 +72,13 @@
  * @desc HEX без #, например 1a0d00
  * @type string
  * @default 1a0d00
+ *
+ * @param keyActions
+ * @text Действия для ремапа (клавиатура/геймпад)
+ * @desc Список действий, которые можно переназначить на экране настроек.
+ *       По умолчанию: ok,escape,menu,cancel,left,right,up,down
+ * @type string
+ * @default ok,escape,menu,cancel,left,right,up,down
  */
 
 (function () {
@@ -158,11 +183,74 @@
     }
 
     // ===================== СОХРАНЕНИЕ В КОНФИГ =====================
+    // Дефолтные маппинги — копия стандартных таблиц MZ (Input.keyMapper и
+    // Input.gamepadMapping), чтобы при первом запуске поведение совпадало
+    // с ванильным. Объявлены до хука ConfigManager.applyData.
+    const DEFAULT_KEY_MAP = {
+        ok:       ['Enter', 'Space', 'NumpadEnter', 'KeyZ'],
+        escape:   ['Escape'],
+        menu:     ['Escape', 'KeyM'],
+        cancel:   ['Escape', 'KeyX'],
+        shift:    ['ShiftLeft', 'ShiftRight', 'KeyA'],
+        control:  ['ControlLeft', 'ControlRight', 'KeyS'],
+        pageup:   ['PageUp', 'KeyQ'],
+        pagedown: ['PageDown', 'KeyW'],
+        left:     ['ArrowLeft'],
+        right:    ['ArrowRight'],
+        up:       ['ArrowUp'],
+        down:     ['ArrowDown']
+    };
+
+    const DEFAULT_PAD_MAP = {
+        ok:       [1],          // B/Cross
+        escape:   [9],          // Start/Options
+        menu:     [9],
+        cancel:   [0],          // A/Circle
+        shift:    [6],          // L1/LB
+        control:  [7],          // R1/RB
+        pageup:   [4],          // L2/LT
+        pagedown: [5],          // R2/RT
+        left:     [14],         // D-Pad Left
+        right:    [15],         // D-Pad Right
+        up:       [12],         // D-Pad Up
+        down:     [13]          // D-Pad Down
+    };
+
+    ConfigManager.arthouseKeyMap = cloneMap(DEFAULT_KEY_MAP);
+    ConfigManager.arthousePadMap = cloneMap(DEFAULT_PAD_MAP);
+
+    // Утилиты маппинга (используются и хуком applyData ниже)
+    function dedupe(arr) {
+        return Array.from(new Set(arr));
+    }
+    function cloneMap(m) {
+        const out = {};
+        for (const k in m) out[k] = m[k].slice();
+        return out;
+    }
+    // Валидация загруженного из конфига маппинга: недостающие действия
+    // заполняем дефолтами, мусор (строки/объекты/неверный тип) выбрасываем.
+    function sanitizeMap(raw, defaults) {
+        const out = {};
+        for (const a of Object.keys(defaults)) {
+            const def = defaults[a] || [];
+            if (raw && Array.isArray(raw[a])) {
+                const clean = raw[a].filter(v => typeof v === typeof def[0]);
+                out[a] = (clean.length || def.length === 0) ? dedupe(clean) : dedupe(def.slice());
+            } else {
+                out[a] = dedupe(def.slice());
+            }
+        }
+        return out;
+    }
+
     const _ConfigManager_makeData = ConfigManager.makeData;
     ConfigManager.makeData = function () {
         const d = _ConfigManager_makeData.call(this);
         d.arthouseResolution = this.arthouseResolution;
         d.arthouseFullscreen = this.arthouseFullscreen;
+        d.arthouseKeyMap = this.arthouseKeyMap;
+        d.arthousePadMap = this.arthousePadMap;
         return d;
     };
 
@@ -172,6 +260,604 @@
         this.arthouseResolution =
             config.arthouseResolution !== undefined ? Number(config.arthouseResolution) : 0;
         this.arthouseFullscreen = !!config.arthouseFullscreen;
+        // Маппинги клавиш/геймпада (валидируем структуру из rpgsave)
+        this.arthouseKeyMap = sanitizeMap(config.arthouseKeyMap, DEFAULT_KEY_MAP);
+        this.arthousePadMap = sanitizeMap(config.arthousePadMap, DEFAULT_PAD_MAP);
+    };
+
+    // ===================== РЕМАП КЛАВИШ И ГЕЙМПАДА =====================
+    // Действия — те же имена, что использует Input.gamepadMapping() MZ.
+    // Порядок списка = порядок строк на экранах настройки.
+    const ACTIONS = ['ok', 'escape', 'menu', 'cancel', 'left', 'right', 'up', 'down'];
+
+    // Какие действия показывать на экранах настройки (параметр keyActions)
+    const EDITABLE_ACTIONS = (() => {
+        const raw = paramStr('keyActions', '')
+            .split(',').map(s => s.trim().toLowerCase())
+            .filter(a => ACTIONS.includes(a));
+        return raw.length ? raw : ACTIONS.slice();
+    })();
+
+    // Человекочитаемые имена клавиш (KeyboardEvent.code -> метка)
+    const KEY_LABELS = {
+        Enter: 'Enter', NumpadEnter: 'Num Enter', Space: 'Space', Tab: 'Tab',
+        Escape: 'Esc', Backspace: 'Back',
+        ShiftLeft: 'L-Shift', ShiftRight: 'R-Shift',
+        ControlLeft: 'L-Ctrl', ControlRight: 'R-Ctrl',
+        AltLeft: 'L-Alt', AltRight: 'R-Alt',
+        PageUp: 'PgUp', PageDown: 'PgDn', Home: 'Home', End: 'End', Insert: 'Ins', Delete: 'Del',
+        ArrowLeft: '←', ArrowUp: '↑', ArrowRight: '→', ArrowDown: '↓',
+        KeyA: 'A', KeyB: 'B', KeyC: 'C', KeyD: 'D', KeyE: 'E', KeyF: 'F', KeyG: 'G', KeyH: 'H',
+        KeyI: 'I', KeyJ: 'J', KeyK: 'K', KeyL: 'L', KeyM: 'M', KeyN: 'N', KeyO: 'O', KeyP: 'P',
+        KeyQ: 'Q', KeyR: 'R', KeyS: 'S', KeyT: 'T', KeyU: 'U', KeyV: 'V', KeyW: 'W', KeyX: 'X',
+        KeyY: 'Y', KeyZ: 'Z',
+        Digit0: '0', Digit1: '1', Digit2: '2', Digit3: '3', Digit4: '4',
+        Digit5: '5', Digit6: '6', Digit7: '7', Digit8: '8', Digit9: '9',
+        Minus: '-', Equal: '=', BracketLeft: '[', BracketRight: ']',
+        Semicolon: ';', Quote: "'", Backquote: '`', Backslash: '\\',
+        Comma: ',', Period: '.', Slash: '/',
+        Numpad0: 'Num0', Numpad1: 'Num1', Numpad2: 'Num2', Numpad3: 'Num3',
+        Numpad4: 'Num4', Numpad5: 'Num5', Numpad6: 'Num6', Numpad7: 'Num7',
+        Numpad8: 'Num8', Numpad9: 'Num9', NumpadAdd: 'Num+', NumpadSubtract: 'Num-',
+        NumpadMultiply: 'Num*', NumpadDivide: 'Num/', NumpadDecimal: 'Num.',
+        F1: 'F1', F2: 'F2', F3: 'F3', F4: 'F4', F5: 'F5', F6: 'F6',
+        F7: 'F7', F8: 'F8', F9: 'F9', F10: 'F10', F11: 'F11', F12: 'F12'
+    };
+
+    // Названия кнопок геймпада (стандартный порядок Gamepad API / XInput)
+    const PAD_BUTTON_NAMES = [
+        'A/Circle', 'B/Cross', 'X/Square', 'Y/Triangle',
+        'LB/L1', 'RB/R1', 'LT/L2', 'RT/R2',
+        'Back/Share', 'Start/Opts', 'Stick L3', 'Stick R3',
+        'D-Up', 'D-Down', 'D-Left', 'D-Right'
+    ];
+
+    const ACTION_LABELS_RU = {
+        ok: 'ОК / подтвердить', escape: 'Esc / выход', menu: 'Меню',
+        cancel: 'Отмена', shift: 'Рывок (Shift)', control: 'Стоп (Ctrl)',
+        pageup: 'Стр. вверх', pagedown: 'Стр. вниз',
+        left: 'Влево', right: 'Вправо', up: 'Вверх', down: 'Вниз'
+    };
+
+    function keyLabel(code) {
+        return KEY_LABELS[code] || code.replace(/^Key/, '').replace(/^Digit/, '');
+    }
+    function padLabel(idx) {
+        return PAD_BUTTON_NAMES[idx] || ('Btn ' + idx);
+    }
+
+    // ---------- Хуки Input: пользовательские маппинги ----------
+    // Свой "триггер"-детект для клавиатуры: onKeyPress очищает _keys,
+    // поэтому standardTriggered не подходит — ведём prev-снимки сами.
+    Input._arthousePrevKeys = null;
+    Input._arthousePrevPads = null;
+
+    Input._arthouseKeyTriggered = function (mapping) {
+        if (!this._arthousePrevKeys) return false;
+        return mapping.some(keyCode =>
+            this._keys[keyCode] && !this._arthousePrevKeys[keyCode]);
+    };
+
+    Input._arthousePadPressed = function (buttonId) {
+        const pads = navigator.gamepads || this.gamepads();
+        if (!pads) return false;
+        for (let i = 0; i < pads.length; i++) {
+            const pad = pads[i];
+            if (pad && pad.buttons[buttonId] && pad.buttons[buttonId].pressed) return true;
+        }
+        return false;
+    };
+
+    Input._arthousePadTriggered = function (buttonId) {
+        if (!this._arthousePrevPads) return false;
+        const pads = navigator.gamepads || this.gamepads();
+        if (!pads) return false;
+        for (let i = 0; i < pads.length; i++) {
+            const pad = pads[i];
+            const prev = this._arthousePrevPads[i];
+            if (pad && prev) {
+                const b = pad.buttons[buttonId];
+                const p = prev[buttonId];
+                if (b && b.pressed && !p) return true;
+            }
+        }
+        return false;
+    };
+
+    // Обновление prev-снимков один раз за игровой цикл (Scene_Base.update)
+    Input._arthouseUpdateSnapshots = function () {
+        this._arthousePrevKeys = Object.assign({}, this._keys);
+        const pads = navigator.gamepads || this.gamepads();
+        if (pads) {
+            this._arthousePrevPads = this._arthousePrevPads || [];
+            for (let i = 0; i < pads.length; i++) {
+                const pad = pads[i];
+                if (!pad) continue;
+                const snap = this._arthousePrevPads[i] = this._arthousePrevPads[i] || [];
+                for (let j = 0; j < pad.buttons.length; j++) {
+                    snap[j] = pad.buttons[j] ? pad.buttons[j].pressed : false;
+                }
+            }
+        }
+    };
+
+    const _Input_isPressed = Input.isPressed;
+    Input.isPressed = function (mapping) {
+        const km = ConfigManager.arthouseKeyMap;
+        if (km && km[mapping] && km[mapping].some(c => this._keys[c])) return true;
+        const pm = ConfigManager.arthousePadMap;
+        if (pm && pm[mapping] && pm[mapping].some(b => this._arthousePadPressed(b))) return true;
+        return _Input_isPressed.call(this, mapping);
+    };
+
+    const _Input_isTriggered = Input.isTriggered;
+    Input.isTriggered = function (mapping) {
+        const km = ConfigManager.arthouseKeyMap;
+        if (km && km[mapping] && this._arthouseKeyTriggered(km[mapping])) return true;
+        const pm = ConfigManager.arthousePadMap;
+        if (pm && pm[mapping] && pm[mapping].some(b => this._arthousePadTriggered(b))) return true;
+        return _Input_isTriggered.call(this, mapping);
+    };
+
+    const _Input_isRepeated = Input.isRepeated;
+    Input.isRepeated = function (mapping) {
+        // isRepeated == triggered || pressed — достаточно делегнуть в isPressed,
+        // т.к. оригинал внутри вызывает именно их.
+        return _Input_isRepeated.call(this, mapping);
+    };
+
+    // Снимки обновляются в начале каждого игрового кадра
+    const _Scene_Base_update = Scene_Base.prototype.update;
+    Scene_Base.prototype.update = function () {
+        Input._arthouseUpdateSnapshots();
+        _Scene_Base_update.call(this);
+    };
+
+    // Разрешённые клавиши для захвата (без сервисных: Esc/F12 и т.п.)
+    const BLOCKED_KEYS = new Set([
+        'F4', 'F5', 'F12', 'Tab', 'Escape',
+        'AltLeft', 'AltRight', 'MetaLeft', 'MetaRight', 'ContextMenu'
+    ]);
+
+    // ---------- БАЗОВЫЙ ЭКРАН НАСТРОЙКИ (клавиши / геймпад) ----------
+    function Scene_ArthouseRebind() {
+        throw new Error('Scene_ArthouseRebind is abstract');
+    }
+    Scene_ArthouseRebind.prototype = Object.create(Scene_Base.prototype);
+    Scene_ArthouseRebind.prototype.constructor = Scene_ArthouseRebind;
+
+    // Переопределяются в наследниках:
+    //  _kind   : 'key' | 'pad'
+    //  _map()  : ссылка на текущий маппинг ConfigManager
+    //  _label(binding) : текст назначенного значения
+    //  _capture(e) : event -> binding (или null)
+
+    Scene_ArthouseRebind.prototype.create = function () {
+        Scene_Base.prototype.create.call(this);
+        this._actions = EDITABLE_ACTIONS.slice();
+        this._selectedAction = 0;
+        this._mode = 'select';        // 'select' | 'edit' | 'confirmClear'
+        this._buildUI();
+    };
+
+    Scene_ArthouseRebind.prototype.start = function () {
+        Scene_Base.prototype.start.call(this);
+        SoundManager.playOk();
+        this._refreshValues();
+        this._refreshSelection();
+    };
+
+    Scene_ArthouseRebind.prototype._buildUI = function () {
+        const W = Graphics.width, H = Graphics.height;
+
+        const container = new PIXI.Container();
+        this.addChild(container);
+        this._container = container;
+
+        const bg = new PIXI.Graphics();
+        bg.beginFill(CONFIG.COL_BG);
+        bg.drawRect(0, 0, W, H);
+        bg.endFill();
+        container.addChild(bg);
+
+        const title = new PIXI.Text(this._titleText(), {
+            fontFamily: FONT_STACK, fontSize: 80, fontWeight: 'bold',
+            fill: CONFIG.COL_INK
+        });
+        title.x = 40; title.y = 25;
+        title.rotation = -0.03;
+        container.addChild(title);
+
+        this._hint = new PIXI.Text('', {
+            fontFamily: FONT_STACK, fontSize: 26, fontWeight: 'bold',
+            fill: CONFIG.COL_INK, wordWrap: true, wordWrapWidth: W - 80
+        });
+        this._hint.x = 40; this._hint.y = 118;
+        container.addChild(this._hint);
+
+        this._rowLabels = [];
+        this._rowValues = [];
+
+        const startY = 175;
+        const n = this._actions.length;
+        const stepY = Math.min(62, Math.max(40, (H - startY - 130) / n));
+        this._startY = startY;
+        this._stepY = stepY;
+
+        this._actions.forEach((action, i) => {
+            const y = startY + i * stepY;
+
+            const lbl = new PIXI.Text(ACTION_LABELS_RU[action] || action, {
+                fontFamily: FONT_STACK, fontSize: Math.min(34, stepY * 0.7),
+                fontWeight: 'bold', fill: CONFIG.COL_INK
+            });
+            lbl.x = 80; lbl.y = y;
+            container.addChild(lbl);
+            this._rowLabels.push(lbl);
+
+            const val = new PIXI.Text('', {
+                fontFamily: FONT_STACK, fontSize: Math.min(34, stepY * 0.7),
+                fontWeight: 'bold', fill: CONFIG.COL_INK
+            });
+            val.anchor.set(1, 0);
+            val.x = W - 70; val.y = y;
+            container.addChild(val);
+            this._rowValues.push(val);
+        });
+
+        const back = new PIXI.Text('← назад (Esc)', {
+            fontFamily: FONT_STACK, fontSize: 34, fontWeight: 'bold',
+            fill: CONFIG.COL_INK
+        });
+        back.x = 80; back.y = H - 75;
+        container.addChild(back);
+
+        this._marker = new PIXI.Graphics();
+        container.addChild(this._marker);
+    };
+
+    Scene_ArthouseRebind.prototype._refreshValues = function () {
+        const map = this._map();
+        this._actions.forEach((a, i) => {
+            const bindings = map[a] || [];
+            this._rowValues[i].text = bindings.length
+                ? bindings.map(b => this._label(b)).join(' + ')
+                : '— нет —';
+        });
+    };
+
+    Scene_ArthouseRebind.prototype._refreshSelection = function () {
+        const y = this._startY + this._selectedAction * this._stepY;
+        const h = this._stepY * 0.75;
+
+        this._marker.clear();
+        this._marker.beginFill(this._mode === 'edit' ? 0xd03000 : 0x000000);
+        this._marker.drawRect(45, y + 2, 9, h);
+        this._marker.endFill();
+
+        this._rowLabels.forEach((lbl, i) => {
+            const on = i === this._selectedAction;
+            const editing = on && this._mode === 'edit';
+            lbl.alpha = on ? 1.0 : 0.5;
+            this._rowValues[i].alpha = on ? 1.0 : 0.5;
+            this._rowValues[i].style.fill = editing ? 0xd03000 : CONFIG.COL_INK;
+        });
+
+        this._hint.text = this._hintText();
+    };
+
+    Scene_ArthouseRebind.prototype._hintText = function () {
+        if (this._mode === 'confirmClear') {
+            return 'Очистить назначение?  OK/Enter — да,  любая другая клавиша / Esc — нет';
+        }
+        if (this._mode === 'edit') return this._editHint();
+        return this._selectHint();
+    };
+
+    Scene_ArthouseRebind.prototype._selectRow = function (idx) {
+        const n = this._actions.length;
+        this._selectedAction = (idx % n + n) % n;
+        this._refreshSelection();
+        SoundManager.playCursor();
+    };
+
+    Scene_ArthouseRebind.prototype.update = function () {
+        Scene_Base.prototype.update.call(this);
+        if (TouchInput.isTriggered()) this._handleClick();
+    };
+
+    Scene_ArthouseRebind.prototype._handleClick = function () {
+        const W = Graphics.width, H = Graphics.height;
+        const mx = TouchInput.x, my = TouchInput.y;
+
+        if (my >= H - 95 && my <= H - 30 && mx >= 60 && mx <= 420) {
+            this._exitScene();
+            return;
+        }
+        for (let i = 0; i < this._actions.length; i++) {
+            const y = this._startY + i * this._stepY;
+            if (my >= y - 6 && my <= y + this._stepY - 6) {
+                this._selectedAction = i;
+                this._enterEdit();
+                return;
+            }
+        }
+    };
+
+    Scene_ArthouseRebind.prototype._enterEdit = function () {
+        this._mode = 'edit';
+        this._refreshSelection();
+        SoundManager.playCursor();
+    };
+
+    Scene_ArthouseRebind.prototype._exitScene = function () {
+        SoundManager.playCancel();
+        this.popScene();
+    };
+
+    Scene_ArthouseRebind.prototype.terminate = function () {
+        document.removeEventListener('keydown', this._onKeyDownBound, true);
+        window.removeEventListener('gamepadconnected', this._onPadConnectedBound, false);
+        if (this._container) {
+            try { this._container.destroy({ children: true }); } catch (e) {}
+            this._container = null;
+        }
+        Scene_Base.prototype.terminate.call(this);
+    };
+
+    // ---------- Экран КЛАВИАТУРЫ ----------
+    function Scene_ArthouseKeyConfig() {
+        this.initialize.apply(this, arguments);
+    }
+    Scene_ArthouseKeyConfig.prototype = Object.create(Scene_ArthouseRebind.prototype);
+    Scene_ArthouseKeyConfig.prototype.constructor = Scene_ArthouseKeyConfig;
+
+    Scene_ArthouseKeyConfig.prototype._kind = 'key';
+
+    Scene_ArthouseKeyConfig.prototype._titleText = function () {
+        return 'клавиши!';
+    };
+    Scene_ArthouseKeyConfig.prototype._selectHint = function () {
+        return '↑/↓ или клик — выбрать действие · Enter/OK — назначить · Del — очистить · Esc — назад';
+    };
+    Scene_ArthouseKeyConfig.prototype._editHint = function () {
+        return 'Нажмите клавишу…  Enter — добавить ещё,  Del — очистить,  Esc — отмена';
+    };
+
+    Scene_ArthouseKeyConfig.prototype._map = function () {
+        return ConfigManager.arthouseKeyMap;
+    };
+    Scene_ArthouseKeyConfig.prototype._label = function (code) {
+        return keyLabel(code);
+    };
+
+    Scene_ArthouseKeyConfig.prototype.start = function () {
+        Scene_ArthouseRebind.prototype.start.call(this);
+        // Перехватываем keydown ДО обработчика MZ (capture-фаза),
+        // чтобы F4/F5 не перезагружали игру во время захвата.
+        this._onKeyDownBound = this._onDocumentKeyDown.bind(this);
+        document.addEventListener('keydown', this._onKeyDownBound, true);
+    };
+
+    Scene_ArthouseKeyConfig.prototype._enterEdit = function () {
+        this._capturedThisFrame = false;
+        Scene_ArthouseRebind.prototype._enterEdit.call(this);
+    };
+
+    Scene_ArthouseKeyConfig.prototype._onDocumentKeyDown = function (ev) {
+        if (this._mode !== 'edit') return;      // select-режим обрабатывает update()
+        ev.stopPropagation();                   // не отдавать событие движку
+        if (this._capturedThisFrame) return;    // защита от автоповтора
+        this._capturedThisFrame = true;
+
+        const code = ev.code;
+
+        if (code === 'Escape') {                // отмена захвата
+            this._mode = 'select';
+            this._refreshSelection();
+            SoundManager.playBuzzer();
+            return;
+        }
+        if (code === 'Delete' || code === 'Backspace') {
+            this._mode = 'confirmClear';
+            this._refreshSelection();
+            SoundManager.playBuzzer();
+            return;
+        }
+        if (BLOCKED_KEYS.has(code)) {
+            SoundManager.playBuzzer();
+            return;
+        }
+
+        const map = this._map();
+        const action = this._actions[this._selectedAction];
+        map[action] = map[action] || [];
+        if (map[action].includes(code)) {
+            SoundManager.playBuzzer();          // уже назначена
+            return;
+        }
+        map[action].push(code);
+        ConfigManager.save();
+        this._refreshValues();
+
+        if (code === 'Enter') {                 // Enter = завершить ввод
+            this._mode = 'select';
+            this._refreshSelection();
+            SoundManager.playOk();
+        } else {
+            // назначили вспомогательную клавишу — можно добавить ещё одну
+            this._capturedThisFrame = false;
+            SoundManager.playOk();
+        }
+    };
+
+    Scene_ArthouseKeyConfig.prototype.update = function () {
+        Scene_ArthouseRebind.prototype.update.call(this);
+        if (this._mode === 'edit') return;      // ввод идёт через capture-хук
+
+        if (Input.isRepeated('down'))  this._selectRow(this._selectedAction + 1);
+        if (Input.isRepeated('up'))    this._selectRow(this._selectedAction - 1);
+
+        if (this._mode === 'select') {
+            // В select-режиме "escape/menu/cancel" = выход со экрана,
+            // "ok" = начать назначение. (Захват клавиши идёт через capture-хук.)
+            if (Input.isTriggered('ok')) {
+                this._enterEdit();
+            } else if (Input.isTriggered('escape') || Input.isTriggered('menu') ||
+                       Input.isTriggered('cancel')) {
+                this._exitScene();
+            }
+            if (Input.isTriggered('shift') || Input.isTriggered('control')) {
+                this._mode = 'confirmClear';
+                this._refreshSelection();
+                SoundManager.playBuzzer();
+            }
+        } else if (this._mode === 'confirmClear') {
+            if (Input.isTriggered('ok') || Input.isTriggered('escape') ||
+                Input.isTriggered('menu') || Input.isTriggered('cancel')) {
+                // "да" = та же кнопка подтверждения/отмены → чистим
+                this._clearSelected();
+                this._mode = 'select';
+                this._refreshSelection();
+            } else if (Input.isTriggered('shift') || Input.isTriggered('control')) {
+                this._mode = 'select';          // "нет"
+                this._refreshSelection();
+                SoundManager.playCancel();
+            }
+        }
+
+        // Сброс всех назначений — PgUp/PgDn или Shift+Del-строка не нужна:
+        if (Input.isTriggered('pageup') || Input.isTriggered('pagedown')) {
+            this._resetAll();
+        }
+    };
+
+    Scene_ArthouseKeyConfig.prototype._clearSelected = function () {
+        const map = this._map();
+        map[this._actions[this._selectedAction]] = [];
+        ConfigManager.save();
+        this._refreshValues();
+        SoundManager.playCancel();
+    };
+
+    Scene_ArthouseKeyConfig.prototype._resetAll = function () {
+        ConfigManager.arthouseKeyMap = sanitizeMap(null, DEFAULT_KEY_MAP);
+        ConfigManager.save();
+        this._refreshValues();
+        SoundManager.playOk();
+    };
+
+    // ---------- Экран ГЕЙМПАДА ----------
+    function Scene_ArthousePadConfig() {
+        this.initialize.apply(this, arguments);
+    }
+    Scene_ArthousePadConfig.prototype = Object.create(Scene_ArthouseRebind.prototype);
+    Scene_ArthousePadConfig.prototype.constructor = Scene_ArthousePadConfig;
+
+    Scene_ArthousePadConfig.prototype._kind = 'pad';
+
+    Scene_ArthousePadConfig.prototype._titleText = function () {
+        return 'геймпад!';
+    };
+    Scene_ArthousePadConfig.prototype._selectHint = function () {
+        return 'Стики/крестовина — выбор · кнопка подтверждения — назначить · Esc — назад';
+    };
+    Scene_ArthousePadConfig.prototype._editHint = function () {
+        return 'Нажмите кнопку на геймпаде…  Esc/подтверждение без кнопки — отмена';
+    };
+
+    Scene_ArthousePadConfig.prototype._map = function () {
+        return ConfigManager.arthousePadMap;
+    };
+    Scene_ArthousePadConfig.prototype._label = function (idx) {
+        return padLabel(idx);
+    };
+
+    Scene_ArthousePadConfig.prototype.start = function () {
+        Scene_ArthouseRebind.prototype.start.call(this);
+        this._onPadConnectedBound = () => {
+            this._padFlash = performance.now() + 1500;
+            this._refreshSelection();
+        };
+        window.addEventListener('gamepadconnected', this._onPadConnectedBound, false);
+    };
+
+    Scene_ArthousePadConfig.prototype._padPresent = function () {
+        const pads = navigator.gamepads || Input.gamepads();
+        return !!(pads && pads.some(p => p));
+    };
+
+    Scene_ArthousePadConfig.prototype._detectPressedButton = function () {
+        const pads = navigator.gamepads || Input.gamepads();
+        if (!pads) return -1;
+        for (let i = 0; i < pads.length; i++) {
+            const pad = pads[i];
+            if (!pad) continue;
+            for (let j = 0; j < pad.buttons.length; j++) {
+                if (pad.buttons[j] && pad.buttons[j].pressed) return j;
+            }
+        }
+        return -1;
+    };
+
+    Scene_ArthousePadConfig.prototype.update = function () {
+        Scene_ArthouseRebind.prototype.update.call(this);
+
+        // Навигация стиками работает только через стандартный маппинг MZ,
+        // пока пользователь не переназначил стрелки — это осознанное
+        // ограничение экрана ремапа (иначе залипнем).
+        if (this._mode === 'select') {
+            if (Input.isRepeated('down'))  this._selectRow(this._selectedAction + 1);
+            if (Input.isRepeated('up'))    this._selectRow(this._selectedAction - 1);
+            if (Input.isTriggered('ok') || Input.isTriggered('escape') ||
+                Input.isTriggered('menu') || Input.isTriggered('cancel')) {
+                this._enterEdit();
+            }
+        } else if (this._mode === 'edit') {
+            const btn = this._detectPressedButton();
+            if (btn >= 0) {
+                const map = this._map();
+                const action = this._actions[this._selectedAction];
+                map[action] = dedupe(map[action].concat([btn]));
+                ConfigManager.save();
+                this._refreshValues();
+                this._mode = 'select';
+                this._refreshSelection();
+                SoundManager.playOk();
+            }
+        }
+
+        if (Input.isTriggered('pageup') || Input.isTriggered('pagedown')) {
+            ConfigManager.arthousePadMap = sanitizeMap(null, DEFAULT_PAD_MAP);
+            ConfigManager.save();
+            this._refreshValues();
+            SoundManager.playOk();
+        }
+    };
+
+    Scene_ArthousePadConfig.prototype._enterEdit = function () {
+        Scene_ArthouseRebind.prototype._enterEdit.call(this);
+        // ждём, пока все кнопки отпустят, чтобы случайно не назначить
+        this._waitRelease = true;
+    };
+
+    Scene_ArthousePadConfig.prototype._detectPressedButton = function () {
+        const pads = navigator.gamepads || Input.gamepads();
+        if (!pads) return -1;
+        for (let i = 0; i < pads.length; i++) {
+            const pad = pads[i];
+            if (!pad) continue;
+            for (let j = 0; j < pad.buttons.length; j++) {
+                if (pad.buttons[j] && pad.buttons[j].pressed) {
+                    if (this._waitRelease) { this._anyPressed = true; }
+                    else return j;
+                }
+            }
+        }
+        if (this._waitRelease && !this._anyPressed) {
+            this._waitRelease = false;
+        }
+        return -1;
     };
 
     // ===================== SCENE: РАСШИРЕННЫЕ НАСТРОЙКИ =====================
@@ -225,12 +911,14 @@
             { label: 'музыка',       type: 'volume' },
             { label: 'звуки',        type: 'volume' },
             { label: 'разрешение',   type: 'resolution' },
-            { label: 'полный экран', type: 'fullscreen' }
+            { label: 'полный экран', type: 'fullscreen' },
+            { label: 'клавиши...',   type: 'scene', scene: Scene_ArthouseKeyConfig },
+            { label: 'геймпад...',   type: 'scene', scene: Scene_ArthousePadConfig }
         ];
         this._rowLabels = [];
         this._rowValues = [];
 
-        const startY = 220, stepY = 90;
+        const startY = 200, stepY = 78;
         this._startY = startY;
         this._stepY = stepY;
 
@@ -238,7 +926,7 @@
             const y = startY + i * stepY;
 
             const lbl = new PIXI.Text(row.label, {
-                fontFamily: FONT_STACK, fontSize: 48, fontWeight: 'bold',
+                fontFamily: FONT_STACK, fontSize: 42, fontWeight: 'bold',
                 fill: CONFIG.COL_INK
             });
             lbl.x = 80; lbl.y = y;
@@ -246,7 +934,7 @@
             this._rowLabels.push(lbl);
 
             const val = new PIXI.Text('', {
-                fontFamily: FONT_STACK, fontSize: 48, fontWeight: 'bold',
+                fontFamily: FONT_STACK, fontSize: 42, fontWeight: 'bold',
                 fill: CONFIG.COL_INK
             });
             val.anchor.set(0.5, 0);
@@ -254,8 +942,11 @@
             container.addChild(val);
             this._rowValues.push(val);
 
+            // Для строк-ссылок ("клавиши...", "геймпад...") стрелки < > не нужны
+            if (row.type === 'scene') return;
+
             const arrL = new PIXI.Text('<', {
-                fontFamily: FONT_STACK, fontSize: 56, fontWeight: 'bold',
+                fontFamily: FONT_STACK, fontSize: 50, fontWeight: 'bold',
                 fill: CONFIG.COL_INK
             });
             arrL.anchor.set(0.5, 0);
@@ -263,7 +954,7 @@
             container.addChild(arrL);
 
             const arrR = new PIXI.Text('>', {
-                fontFamily: FONT_STACK, fontSize: 56, fontWeight: 'bold',
+                fontFamily: FONT_STACK, fontSize: 50, fontWeight: 'bold',
                 fill: CONFIG.COL_INK
             });
             arrR.anchor.set(0.5, 0);
@@ -292,6 +983,15 @@
         const r = OPTIONS_RESOLUTIONS[ConfigManager.arthouseResolution];
         this._rowValues[2].text = r ? r.label : '—';
         this._rowValues[3].text = ConfigManager.arthouseFullscreen ? 'Вкл' : 'Выкл';
+        this._rowValues[4].text = '→ настроить';
+        this._rowValues[5].text = this._padPresent() ? 'подключён →' : '→ настроить';
+    };
+
+    Scene_ArthouseOptions.prototype._padPresent = function () {
+        try {
+            const pads = navigator.getGamepads ? navigator.getGamepads() : null;
+            return !!(pads && Array.from(pads).some(p => p));
+        } catch (e) { return false; }
     };
 
     Scene_ArthouseOptions.prototype._refreshSelection = function () {
@@ -299,7 +999,7 @@
 
         this._marker.clear();
         this._marker.beginFill(0x000000);
-        this._marker.drawRect(40, y + 14, 8, 44);
+        this._marker.drawRect(40, y + 10, 8, 38);
         this._marker.endFill();
 
         this._rowLabels.forEach((lbl, i) => {
@@ -333,6 +1033,10 @@
         } else if (r === 3) {
             ConfigManager.arthouseFullscreen = !ConfigManager.arthouseFullscreen;
             applyFullscreen(ConfigManager.arthouseFullscreen);
+        } else if (this._rows[r] && this._rows[r].type === 'scene') {
+            // "клавиши..." / "геймпад..." — открываем вложенный экран
+            SceneManager.push(this._rows[r].scene);
+            return;
         }
         ConfigManager.save();
         this._refreshValues();
@@ -358,6 +1062,10 @@
             SoundManager.playCancel();
             this.popScene();
         }
+
+        // Обновляем индикатор подключения геймпада ("подключён →")
+        this._padPoll = (this._padPoll || 0) + 1;
+        if (this._padPoll % 60 === 0) this._refreshValues();
     };
 
     Scene_ArthouseOptions.prototype._handleClick = function () {
@@ -374,7 +1082,15 @@
         // Строки
         for (let i = 0; i < this._rows.length; i++) {
             const y = this._startY + i * this._stepY;
-            if (my >= y - 10 && my <= y + 70) {
+            if (my >= y - 10 && my <= y + this._stepY - 8) {
+                const row = this._rows[i];
+                if (row.type === 'scene') {
+                    // клик по строке-ссылке сразу открывает вложенный экран
+                    this._selectedRow = i;
+                    this._refreshSelection();
+                    this._changeValue(+1);
+                    return;
+                }
                 if (mx > W - 430 && mx < W - 370) {
                     this._selectRow(i);
                     this._changeValue(-1);
@@ -399,6 +1115,8 @@
 
     // Экспорт в глобал (для вызова из событий/других плагинов)
     window.Scene_ArthouseOptions = Scene_ArthouseOptions;
+    window.Scene_ArthouseKeyConfig = Scene_ArthouseKeyConfig;
+    window.Scene_ArthousePadConfig = Scene_ArthousePadConfig;
 
     function clamp(v, min, max) {
         return Math.max(min, Math.min(max, v));
